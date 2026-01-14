@@ -98,9 +98,15 @@ app.post(
 		console.log("stripeEvent", stripeEvent);
 
 		// Handle the checkout.session.completed event
-		if (stripeEvent.type === "checkout.session.completed") {
+		// if (stripeEvent.type === "checkout.session.completed") {
+		if (stripeEvent.type === "charge.succeeded") {
 			const session = stripeEvent.data.object;
 			console.log("stripe session:", session);
+			console.log("stripe session- billing_details:", session.billing_details);
+			console.log(
+				"stripe session- payment_method_details:",
+				session.payment_method_details
+			);
 			try {
 				const customerEmail =
 					session.customer_details?.email || session.customer_email;
