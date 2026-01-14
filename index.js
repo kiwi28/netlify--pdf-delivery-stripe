@@ -95,6 +95,8 @@ app.post(
 			return res.status(400).send(`Webhook Error: ${err.message}`);
 		}
 
+		console.log("stripeEvent", stripeEvent);
+
 		// Handle the checkout.session.completed event
 		if (stripeEvent.type === "checkout.session.completed") {
 			const session = stripeEvent.data.object;
