@@ -1,5 +1,3 @@
-// netlify/functions/stripe-webhook.js
-
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const nodemailer = require("nodemailer");
 
