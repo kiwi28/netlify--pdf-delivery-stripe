@@ -1,22 +1,21 @@
+const express = require("express");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const nodemailer = require("nodemailer");
+
+const app = express();
 
 // Configure Gmail transporter
 const transporter = nodemailer.createTransport({
 	service: "gmail",
 	auth: {
 		user: process.env.GMAIL_USER,
-		pass: process.env.GMAIL_APP_PASSWORD, // Use App Password, not regular password
+		pass: process.env.GMAIL_APP_PASSWORD,
 	},
 });
 
 // Helper function to get PDF link based on pdf_id
 function getPDFLink(pdfId) {
-	// Option 1: If PDFs are in Google Drive
 	return `https://drive.google.com/file/d/${pdfId}/view`;
-
-	// Option 2: If PDFs are hosted on your domain
-	// return `https://yourdomain.com/pdfs/${pdfId}.pdf`;
 }
 
 // Helper function to send email
@@ -76,102 +75,87 @@ async function sendEmailWithPDF(
 	}
 }
 
-// Main handler
-exports.handler = async (event) => {
-	// Only accept POST requests
-	if (event.httpMethod !== "POST") {
-		return {
-			statusCode: 405,
-			body: JSON.stringify({ error: "Method Not Allowed" }),
-		};
-	}
-
-	const sig = event.headers["stripe-signature"];
-	let stripeEvent;
-
-	try {
-		// Verify webhook signature
-		stripeEvent = stripe.webhooks.constructEvent(
-			event.body,
-			sig,
-			process.env.STRIPE_WEBHOOK_SECRET
-		);
-	} catch (err) {
-		console.error("Webhook signature verification failed:", err.message);
-		return {
-			statusCode: 400,
-			body: JSON.stringify({ error: `Webhook Error: ${err.message}` }),
-		};
-	}
-
-	// Handle the checkout.session.completed event
-	if (stripeEvent.type === "checkout.session.completed") {
-		const session = stripeEvent.data.object;
+// Stripe webhook endpoint
+app.post(
+	"/webhook",
+	express.raw({ type: "application/json" }),
+	async (req, res) => {
+		const sig = req.headers["stripe-signature"];
+		let stripeEvent;
 
 		try {
-			// Get customer email
-			const customerEmail =
-				session.customer_details?.email || session.customer_email;
-			const customerName = session.customer_details?.name;
-
-			if (!customerEmail) {
-				console.error("No customer email found");
-				return {
-					statusCode: 400,
-					body: JSON.stringify({ error: "No customer email found" }),
-				};
-			}
-
-			// Get line items to access product metadata
-			const lineItems = await stripe.checkout.sessions.listLineItems(
-				session.id,
-				{
-					expand: ["data.price.product"],
-				}
+			stripeEvent = stripe.webhooks.constructEvent(
+				req.body,
+				sig,
+				process.env.STRIPE_WEBHOOK_SECRET
 			);
+		} catch (err) {
+			console.error("Webhook signature verification failed:", err.message);
+			return res.status(400).send(`Webhook Error: ${err.message}`);
+		}
 
-			// Process each product
-			for (const item of lineItems.data) {
-				const product = item.price.product;
-				const pdfId = product.metadata?.pdf_id;
+		// Handle the checkout.session.completed event
+		if (stripeEvent.type === "checkout.session.completed") {
+			const session = stripeEvent.data.object;
 
-				if (pdfId) {
-					console.log(
-						`Sending email for product: ${product.name}, PDF ID: ${pdfId}`
-					);
+			try {
+				const customerEmail =
+					session.customer_details?.email || session.customer_email;
+				const customerName = session.customer_details?.name;
 
-					await sendEmailWithPDF(
-						customerEmail,
-						customerName,
-						pdfId,
-						product.name
-					);
-				} else {
-					console.warn(
-						`No pdf_id found in metadata for product: ${product.name}`
-					);
+				if (!customerEmail) {
+					console.error("No customer email found");
+					return res.status(400).json({ error: "No customer email found" });
 				}
-			}
 
-			return {
-				statusCode: 200,
-				body: JSON.stringify({ received: true, emailSent: true }),
-			};
-		} catch (error) {
-			console.error("Error processing webhook:", error);
-			return {
-				statusCode: 500,
-				body: JSON.stringify({
+				const lineItems = await stripe.checkout.sessions.listLineItems(
+					session.id,
+					{
+						expand: ["data.price.product"],
+					}
+				);
+
+				for (const item of lineItems.data) {
+					const product = item.price.product;
+					const pdfId = product.metadata?.pdf_id;
+
+					if (pdfId) {
+						console.log(
+							`Sending email for product: ${product.name}, PDF ID: ${pdfId}`
+						);
+						await sendEmailWithPDF(
+							customerEmail,
+							customerName,
+							pdfId,
+							product.name
+						);
+					} else {
+						console.warn(
+							`No pdf_id found in metadata for product: ${product.name}`
+						);
+					}
+				}
+
+				return res.json({ received: true, emailSent: true });
+			} catch (error) {
+				console.error("Error processing webhook:", error);
+				return res.status(500).json({
 					error: "Error processing webhook",
 					details: error.message,
-				}),
-			};
+				});
+			}
 		}
-	}
 
-	// Return 200 for other event types
-	return {
-		statusCode: 200,
-		body: JSON.stringify({ received: true }),
-	};
-};
+		res.json({ received: true });
+	}
+);
+
+// Health check endpoint
+app.get("/health", (req, res) => {
+	res.json({ status: "ok" });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+	console.log(`Webhook server listening on port ${PORT}`);
+});
