@@ -82,6 +82,7 @@ app.post(
 	async (req, res) => {
 		const sig = req.headers["stripe-signature"];
 		let stripeEvent;
+		console.log("stripe req incoming");
 
 		try {
 			stripeEvent = stripe.webhooks.constructEvent(
@@ -97,7 +98,7 @@ app.post(
 		// Handle the checkout.session.completed event
 		if (stripeEvent.type === "checkout.session.completed") {
 			const session = stripeEvent.data.object;
-
+			console.log("stripe session:", session);
 			try {
 				const customerEmail =
 					session.customer_details?.email || session.customer_email;
