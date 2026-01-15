@@ -5,11 +5,20 @@ const nodemailer = require("nodemailer");
 const app = express();
 
 // Configure Gmail transporter
+if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASS) {
+	console.log("process.env.GMAIL_USER", process.env.GMAIL_USER);
+	console.log(
+		"GMAIL_APP_PASS length:",
+		(process.env.GMAIL_APP_PASS || "").length
+	);
+	throw new Error("Missing GMAIL_USER or GMAIL_APP_PASS environment variables");
+}
+
 const transporter = nodemailer.createTransport({
 	service: "gmail",
 	auth: {
 		user: process.env.GMAIL_USER,
-		pass: process.env.GMAIL_APP_PASSWORD,
+		pass: process.env.GMAIL_APP_PASS,
 	},
 });
 
@@ -81,81 +90,100 @@ app.post(
 	express.raw({ type: "application/json" }),
 	async (req, res) => {
 		const sig = req.headers["stripe-signature"];
-		let stripeEvent;
-		console.log("stripe req incoming");
+		let event;
 
 		try {
-			stripeEvent = stripe.webhooks.constructEvent(
+			event = stripe.webhooks.constructEvent(
 				req.body,
 				sig,
 				process.env.STRIPE_WEBHOOK_SECRET
 			);
 		} catch (err) {
-			console.error("Webhook signature verification failed:", err.message);
-			return res.status(400).send(`Webhook Error: ${err.message}`);
+			return res.status(400).send(`Webhook Error: ${err?.message}`);
 		}
 
-		console.log("stripeEvent", stripeEvent);
+		// Fulfill events for Payment Links/Checkout
+		const fulfillable = new Set([
+			"checkout.session.completed",
+			"checkout.session.async_payment_succeeded",
+		]);
 
-		// Handle the checkout.session.completed event
-		// if (stripeEvent.type === "checkout.session.completed") {
-		if (stripeEvent.type === "charge.succeeded") {
-			const session = stripeEvent.data.object;
-			console.log("stripe session:", session);
-			console.log("stripe session- billing_details:", session.billing_details);
-			console.log(
-				"stripe session- payment_method_details:",
-				session.payment_method_details
+		if (!fulfillable.has(event.type)) {
+			return res.json({ received: true });
+		}
+
+		const sessionFromEvent = event.data.object; // Checkout Session for these event types ([docs.stripe.com](https://docs.stripe.com/payments/payment-element/migration-ewcs?utm_source=openai))
+
+		// Optional: ensure this session came from a Payment Link
+		// (Checkout Session has payment_link when created from a Payment Link) ([docs.stripe.com](https://docs.stripe.com/api/checkout/sessions/object?utm_source=openai))
+		if (!sessionFromEvent.payment_link) {
+			return res.json({ received: true });
+		}
+
+		try {
+			// Stripe recommends retrieving the session and expanding line_items for fulfillment ([docs.stripe.com](https://docs.stripe.com/checkout/fulfillment?utm_source=openai))
+			const session = await stripe.checkout.sessions.retrieve(
+				sessionFromEvent.id,
+				{
+					expand: ["line_items.data.price.product"],
+				}
 			);
-			try {
-				const customerEmail =
-					session.customer_details?.email || session.customer_email;
-				const customerName = session.customer_details?.name;
 
-				if (!customerEmail) {
-					console.error("No customer email found");
-					return res.status(400).json({ error: "No customer email found" });
-				}
-
-				const lineItems = await stripe.checkout.sessions.listLineItems(
-					session.id,
-					{
-						expand: ["data.price.product"],
-					}
-				);
-
-				for (const item of lineItems.data) {
-					const product = item.price.product;
-					const pdfId = product.metadata?.pdf_id;
-
-					if (pdfId) {
-						console.log(
-							`Sending email for product: ${product.name}, PDF ID: ${pdfId}`
-						);
-						await sendEmailWithPDF(
-							customerEmail,
-							customerName,
-							pdfId,
-							product.name
-						);
-					} else {
-						console.warn(
-							`No pdf_id found in metadata for product: ${product.name}`
-						);
-					}
-				}
-
-				return res.json({ received: true, emailSent: true });
-			} catch (error) {
-				console.error("Error processing webhook:", error);
-				return res.status(500).json({
-					error: "Error processing webhook",
-					details: error.message,
+			// Only fulfill paid sessions ([docs.stripe.com](https://docs.stripe.com/api/checkout/sessions/object?utm_source=openai))
+			if (session.payment_status !== "paid") {
+				return res.json({
+					received: true,
+					fulfilled: false,
+					reason: "not_paid",
 				});
 			}
-		}
 
-		res.json({ received: true });
+			const customerEmail =
+				session.customer_details?.email || session.customer_email;
+			const customerName = session.customer_details?.name || null;
+
+			if (!customerEmail) {
+				// Don't 400 here; if you do, Stripe will keep retrying.
+				// Log and acknowledge.
+				console.error("No customer email on Checkout Session", session.id);
+				return res.json({
+					received: true,
+					fulfilled: false,
+					reason: "no_email",
+				});
+			}
+
+			// TODO: Idempotency: check DB if session.id or event.id already fulfilled; skip if yes ([docs.stripe.com](https://docs.stripe.com/checkout/fulfillment?utm_source=openai))
+
+			console.log("session", session);
+			console.log("session.line_items", session.line_items);
+
+			const items = session.line_items?.data || [];
+			for (const item of items) {
+				const product = item.price?.product; // expanded
+				const pdfId = session?.metadata?.pdf_id;
+
+				if (pdfId) {
+					await sendEmailWithPDF(
+						customerEmail,
+						customerName,
+						pdfId,
+						product.name
+					);
+				} else {
+					console.warn(
+						`No pdf_id in product.metadata for product: ${product?.name}`
+					);
+				}
+			}
+
+			// TODO: Mark session.id fulfilled in DB here
+			return res.json({ received: true, fulfilled: true });
+		} catch (err) {
+			console.error("Webhook fulfillment error:", err);
+			// 500 tells Stripe to retry (good for transient failures)
+			return res.status(500).json({ error: err.message });
+		}
 	}
 );
 
